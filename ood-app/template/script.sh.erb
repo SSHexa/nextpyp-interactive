@@ -1,0 +1,301 @@
+#!/bin/bash
+#
+# NextPYP Desktop - launcher for Open OnDemand Interactive App.
+# See docs/CONFIGURATION.md for every env var.
+#
+
+set -e
+
+echo "=== Starting NextPYP Desktop ==="
+
+# ============================================
+# Load site config
+# ============================================
+# Adopters: put site-wide defaults in template/env (sourced here, gitignored)
+# or set env vars via OOD's cluster/app configuration.
+if [ -f "$(dirname "$0")/env" ]; then
+    # shellcheck disable=SC1091
+    . "$(dirname "$0")/env"
+fi
+
+NEXTPYP_INSTALL="${NEXTPYP_INSTALL:-/opt/nextpyp}"
+NEXTPYP_HOME="${NEXTPYP_HOME:-$HOME/nextpyp}"
+NEXTPYP_PARTITION="${NEXTPYP_PARTITION:-compute}"
+NEXTPYP_BIND_MOUNTS="${NEXTPYP_BIND_MOUNTS:-/scratch}"
+NEXTPYP_FALLBACK_CPUS="${NEXTPYP_FALLBACK_CPUS:-4}"
+NEXTPYP_FALLBACK_MEM_MB="${NEXTPYP_FALLBACK_MEM_MB:-8192}"
+CLUSTER_MODE="${CLUSTER_MODE:-generic}"
+
+if [ ! -f "${NEXTPYP_INSTALL}/nextPYP.sif" ]; then
+    echo "FATAL: nextPYP.sif not found at ${NEXTPYP_INSTALL}/nextPYP.sif"
+    echo "Set NEXTPYP_INSTALL to the directory containing nextPYP.sif and sharedExec/containers/pyp.sif."
+    exit 1
+fi
+if [ ! -f "${NEXTPYP_INSTALL}/sharedExec/containers/pyp.sif" ]; then
+    echo "FATAL: pyp.sif not found at ${NEXTPYP_INSTALL}/sharedExec/containers/pyp.sif"
+    exit 1
+fi
+
+OOD_SESSION_DIR="$(pwd)"
+echo "Session Directory: ${OOD_SESSION_DIR}"
+
+# ============================================
+# PART 1: Prepare persistent directories
+# ============================================
+SESSION_LOCAL="${NEXTPYP_HOME}/local"
+SESSION_SHARED="${NEXTPYP_HOME}/shared"
+SESSION_EXEC="${NEXTPYP_HOME}/exec"
+mkdir -p "${SESSION_LOCAL}"/{logs,db,sock}
+mkdir -p "${SESSION_SHARED}"/{batch,log,users,os-users,sessions,groups,user-processors}
+mkdir -p "${SESSION_EXEC}/containers"
+
+ln -sf "${NEXTPYP_INSTALL}/nextPYP.sif" "${SESSION_EXEC}/nextPYP.sif"
+[ ! -e "${SESSION_EXEC}/containers/pyp.sif" ] && \
+    ln -sf "${NEXTPYP_INSTALL}/sharedExec/containers/pyp.sif" "${SESSION_EXEC}/containers/pyp.sif" || true
+
+# ============================================
+# PART 2: Port + IP discovery
+# ============================================
+NEXTPYP_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+echo "NextPYP will run on port: ${NEXTPYP_PORT}"
+echo "${NEXTPYP_PORT}" > "${OOD_SESSION_DIR}/nextpyp_port"
+
+# Routable IPv4 for cross-node SLURM jobs to reach the web server.
+# Env override wins; otherwise ask the routing table which local IP would
+# reach the internet (works on any private network / cloud); final fallback
+# is the first IP from `hostname -I`.
+NODE_IP="${NEXTPYP_BIND_IP:-}"
+if [ -z "$NODE_IP" ]; then
+    NODE_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+fi
+if [ -z "$NODE_IP" ]; then
+    NODE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+[ -z "$NODE_IP" ] && NODE_IP=127.0.0.1
+echo "NextPYP web bind: $NODE_IP"
+
+# ============================================
+# PART 3: Dynamic Slurm sizing from sinfo
+# ============================================
+CPUS=$(sinfo -h -p "${NEXTPYP_PARTITION}" -o "%c" 2>/dev/null | sort -nu | tail -1)
+MEM_MB=$(sinfo -h -p "${NEXTPYP_PARTITION}" -o "%m" 2>/dev/null | sort -nu | tail -1)
+[ -z "$CPUS" ] || [ "$CPUS" = 0 ] && CPUS="${NEXTPYP_FALLBACK_CPUS}"
+[ -z "$MEM_MB" ] || [ "$MEM_MB" = 0 ] && MEM_MB="${NEXTPYP_FALLBACK_MEM_MB}"
+MEM_GB_PER_CPU=$(( MEM_MB / CPUS / 1024 ))
+[ "$MEM_GB_PER_CPU" -lt 1 ] && MEM_GB_PER_CPU=1
+echo "Slurm sizing: partition=${NEXTPYP_PARTITION} cpusPerTask=${CPUS} memPerCpuGB=${MEM_GB_PER_CPU}"
+
+# Keep shared Slurm template in sync with live partition size (best effort).
+TEMPLATE="${NEXTPYP_INSTALL}/templates/default.peb"
+if [ -w "$TEMPLATE" ]; then
+    sed -i "s|--mem-per-cpu=[0-9]*G|--mem-per-cpu=${MEM_GB_PER_CPU}G|" "$TEMPLATE"
+    echo "Patched $TEMPLATE with --mem-per-cpu=${MEM_GB_PER_CPU}G"
+else
+    echo "Note: ${TEMPLATE} not writable; not patched. Set --mem-per-cpu manually if needed."
+fi
+
+# ============================================
+# PART 4: Bind mounts
+# ============================================
+# NEXTPYP_BIND_MOUNTS is a comma-separated list of host:container paths (or
+# plain paths — apptainer treats /x as /x:/x). Iterate and build --bind flags.
+BIND_FLAGS=()
+CONFIG_BINDS=()
+IFS=',' read -r -a _binds <<< "${NEXTPYP_BIND_MOUNTS}"
+for b in "${_binds[@]}"; do
+    b="$(echo "$b" | xargs)"
+    [ -z "$b" ] && continue
+    BIND_FLAGS+=(--bind "$b")
+    CONFIG_BINDS+=("\"${b%%:*}\"")
+done
+
+# Optional CycleCloud dual-filesystem mode: OOD's /shared is exported to
+# compute nodes as /sched-shared. See docs/CYCLECLOUD.md.
+if [ "${CLUSTER_MODE}" = "cyclecloud" ]; then
+    BIND_FLAGS+=(--bind /sched-shared:/sched-shared)
+    CONFIG_BINDS+=("\"/sched-shared\"")
+    echo "CLUSTER_MODE=cyclecloud: added /sched-shared bind"
+fi
+
+# Format CONFIG_BINDS as a TOML array
+CONFIG_BINDS_TOML="[$(IFS=,; echo "${CONFIG_BINDS[*]}")]"
+
+# ============================================
+# PART 5: Generate config.toml (per-session, live NODE_IP/PORT)
+# ============================================
+cat > "${SESSION_EXEC}/config.toml" << CFGEOF
+[pyp]
+scratch = "/tmp/nextpyp_scratch"
+binds = ${CONFIG_BINDS_TOML}
+container = "${SESSION_EXEC}/containers/pyp.sif"
+
+[slurm]
+templatesDir = "${NEXTPYP_INSTALL}/templates"
+partition = "${NEXTPYP_PARTITION}"
+cpusPerTask = ${CPUS}
+memoryPerCpuGB = ${MEM_GB_PER_CPU}
+gpusPerTask = 0
+wallTimeHours = 4
+
+[web]
+localDir = "${SESSION_LOCAL}"
+sharedDir = "${SESSION_SHARED}"
+sharedExecDir = "${SESSION_EXEC}"
+workflowDirs = ["${NEXTPYP_INSTALL}/workflows"]
+auth = "none"
+host = "${NODE_IP}"
+port = ${NEXTPYP_PORT}
+CFGEOF
+
+ln -sf "${SESSION_EXEC}/config.toml" "${OOD_SESSION_DIR}/config.toml"
+
+export NEXTPYP_LOCAL="${SESSION_LOCAL}"
+export NEXTPYP_HEAPMIB=2048
+export NEXTPYP_DATABASE_MEMGB=1.0
+export PYP_CONFIG="${SESSION_EXEC}/config.toml"
+
+# ============================================
+# PART 6: Start host processor + NextPYP container
+# ============================================
+echo "Starting host processor..."
+cp "${NEXTPYP_INSTALL}/nextpyp-host-processor" "${OOD_SESSION_DIR}/"
+cd "${SESSION_LOCAL}/sock"
+"${OOD_SESSION_DIR}/nextpyp-host-processor" > "${SESSION_LOCAL}/logs/hostprocessor" 2>&1 &
+HP_PID=$!
+cd "${OOD_SESSION_DIR}"
+export NEXTPYP_HOSTPROCESSOR_PID=$HP_PID
+echo "Host processor PID: ${HP_PID}"
+sleep 2
+
+if ! kill -0 ${HP_PID} 2>/dev/null; then
+    echo "ERROR: Host processor died"
+    cat "${SESSION_LOCAL}/logs/hostprocessor"
+    exit 1
+fi
+
+echo "Starting NextPYP container..."
+apptainer exec \
+    --env "NEXTPYP_LOCAL=${SESSION_LOCAL}" \
+    --env "NEXTPYP_HEAPMIB=2048" \
+    --env "NEXTPYP_DATABASE_MEMGB=1.0" \
+    --env "NEXTPYP_HOSTPROCESSOR_PID=${HP_PID}" \
+    --env "PYP_CONFIG_HOST=${SESSION_EXEC}/config.toml" \
+    --bind "${SESSION_EXEC}/config.toml:/var/micromon/config.toml" \
+    --bind "${SESSION_LOCAL}:${SESSION_LOCAL}" \
+    --bind "${SESSION_SHARED}:${SESSION_SHARED}" \
+    --bind "${SESSION_EXEC}:${SESSION_EXEC}" \
+    --bind "${SESSION_LOCAL}/sock:/run/nextpyp/sock" \
+    "${BIND_FLAGS[@]}" \
+    --writable-tmpfs \
+    --no-home \
+    "${SESSION_EXEC}/nextPYP.sif" \
+    /opt/micromon/init.sh > "${SESSION_LOCAL}/logs/container.log" 2>&1 &
+CONTAINER_PID=$!
+echo "Container PID: ${CONTAINER_PID}"
+
+# Wait for NextPYP to be ready
+echo "Waiting for NextPYP to start..."
+for i in {1..60}; do
+    if curl -s "http://${NODE_IP}:${NEXTPYP_PORT}/" > /dev/null 2>&1; then
+        echo "NextPYP is ready on port ${NEXTPYP_PORT}!"
+        break
+    fi
+    sleep 2
+done
+
+if ! curl -s "http://${NODE_IP}:${NEXTPYP_PORT}/" > /dev/null 2>&1; then
+    echo "WARNING: NextPYP may not have started. Check logs."
+    tail -30 "${SESSION_LOCAL}/logs/container.log" 2>/dev/null || true
+fi
+
+# ============================================
+# PART 7: Start VNC Desktop with Firefox autostart
+# ============================================
+cd "${HOME}"
+export SHELL="$(getent passwd $USER | cut -d: -f7)"
+
+AUTOSTART="${HOME}/.config/autostart"
+mkdir -p "${AUTOSTART}"
+
+# Disable screen lock, power manager, and screensaver
+for service in "xfce4-power-manager" "xfce-polkit" "light-locker" "xfce4-screensaver"; do
+  echo -e "[Desktop Entry]\nHidden=true" > "${AUTOSTART}/${service}.desktop"
+done
+
+mkdir -p "${HOME}/.config/xfce4/xfconf/xfce-perchannel-xml"
+cat > "${HOME}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-screensaver.xml" << SSEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-screensaver" version="1.0">
+  <property name="saver" type="empty">
+    <property name="enabled" type="bool" value="false"/>
+  </property>
+  <property name="lock" type="empty">
+    <property name="enabled" type="bool" value="false"/>
+  </property>
+</channel>
+SSEOF
+
+xfconf-query -c xfce4-screensaver -p /saver/enabled -s false 2>/dev/null || true
+xfconf-query -c xfce4-screensaver -p /lock/enabled -s false 2>/dev/null || true
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/blank-on-ac -s 0 2>/dev/null || true
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled -s false 2>/dev/null || true
+
+# Firefox software WebGL — TurboVNC has no GPU so hardware WebGL fails.
+# NextPYP's plot/gallery/tilt-series viewers require WebGL.
+LAUNCHER="${OOD_SESSION_DIR}/launch_firefox.sh"
+FF_PROFILE="${OOD_SESSION_DIR}/ffprofile"
+mkdir -p "${FF_PROFILE}"
+cat > "${FF_PROFILE}/user.js" << 'FFPREFEOF'
+user_pref("webgl.force-enabled", true);
+user_pref("webgl.disabled", false);
+user_pref("webgl.allow-windows-native-gl", true);
+user_pref("webgl.software-render", true);
+user_pref("gfx.x11-egl.force-enabled", true);
+user_pref("layers.acceleration.force-enabled", true);
+FFPREFEOF
+
+cat > "${LAUNCHER}" << LAUNCHEOF
+#!/bin/bash
+sleep 5
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=llvmpipe
+export MOZ_X11_EGL=1
+BROWSER=\$(command -v firefox-esr 2>/dev/null || command -v firefox 2>/dev/null)
+if [ -n "\$BROWSER" ]; then
+    \$BROWSER --profile "${FF_PROFILE}" --no-remote http://${NODE_IP}:${NEXTPYP_PORT}/
+fi
+LAUNCHEOF
+chmod +x "${LAUNCHER}"
+
+cat > "${AUTOSTART}/nextpyp-firefox.desktop" << FFEOF
+[Desktop Entry]
+Type=Application
+Name=NextPYP Browser
+Exec=${LAUNCHER}
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+FFEOF
+
+PANEL_CONFIG="${HOME}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+if [[ ! -e "${PANEL_CONFIG}" ]]; then
+  mkdir -p "$(dirname "${PANEL_CONFIG}")"
+  cp "/etc/xdg/xfce4/panel/default.xml" "${PANEL_CONFIG}" 2>/dev/null || true
+fi
+
+xfconf-query -c xfce4-session -p /startup/ssh-agent/enabled -n -t bool -s false 2>/dev/null || true
+xfconf-query -c xfce4-session -p /startup/gpg-agent/enabled -n -t bool -s false 2>/dev/null || true
+
+echo "================================================"
+echo "NextPYP URL: http://${NODE_IP}:${NEXTPYP_PORT}/"
+echo "Firefox will auto-open to NextPYP"
+echo "================================================"
+
+SAFE_PATH="/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin"
+eval $(PATH="$SAFE_PATH" dbus-launch --sh-syntax)
+PATH="$SAFE_PATH" xfce4-session
+
+# Cleanup
+echo "Desktop session ended, cleaning up..."
+kill ${CONTAINER_PID} 2>/dev/null || true
+kill ${HP_PID} 2>/dev/null || true

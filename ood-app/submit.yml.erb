@@ -1,0 +1,10 @@
+---
+batch_connect:
+  template: vnc
+  vnc_args: "-securitytypes None"
+script:
+  native:
+    - "-p"
+    - "<%= bc_queue %>"
+    - "-c"
+    - "<%= bc_num_slots %>"

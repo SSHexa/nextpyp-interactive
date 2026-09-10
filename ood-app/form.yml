@@ -1,0 +1,24 @@
+---
+# Adopters: set `cluster:` to the name of the OOD cluster config file
+# (without the .yml extension) at /etc/ood/config/clusters.d/<name>.yml.
+cluster: "slurm"
+attributes:
+  bc_vnc_resolution:
+    required: true
+  bc_num_hours:
+    label: "Wall Time (hours)"
+    value: 8
+  bc_num_slots:
+    label: "Number of CPUs (for VNC session)"
+    value: 2
+    min: 1
+    max: 4
+    help: "CPUs for the web interface. Processing jobs run on separate nodes."
+  bc_queue:
+    label: "Partition"
+    value: "compute"
+form:
+  - bc_num_hours
+  - bc_num_slots
+  - bc_queue
+  - bc_vnc_resolution

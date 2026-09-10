@@ -1,0 +1,12 @@
+---
+name: NextPYP Desktop
+icon: fas://desktop
+category: Applications
+subcategory: Cryo-EM
+role: batch_connect
+description: |
+  **NextPYP Desktop Session**
+
+  Launch NextPYP with a VNC desktop session on the cluster.
+  Firefox auto-opens to the NextPYP interface. Projects and jobs
+  persist across session restarts.

@@ -1,0 +1,35 @@
+# Site-specific config (never commit — sourced by launcher at runtime)
+ood-app/template/env
+
+# Backups
+*.bak
+*.bak-*
+*.orig
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Session artefacts (in case anyone runs this in-tree)
+nextpyp/local/
+nextpyp/shared/
+nextpyp/exec/
+ffprofile/
+launch_firefox.sh
+nextpyp-host-processor
+nextpyp_port
+config.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+*.pem
+*.key

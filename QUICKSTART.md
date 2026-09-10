@@ -32,7 +32,7 @@ Put them under a single directory, e.g. `/opt/nextpyp/`:
 ## 2. Clone this repo
 
 ```bash
-git clone https://github.com/YOUR-ORG/nextpyp-ood-interactive
+git clone https://github.com/SSHexa/nextpyp-interactive
 cd nextpyp-ood-interactive
 ```
 

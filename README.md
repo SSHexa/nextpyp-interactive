@@ -23,7 +23,7 @@ Users click **Launch** in their OOD dashboard and land in a full XFCE desktop wi
 ## Install (5 min)
 
 ```bash
-git clone https://github.com/YOUR-ORG/nextpyp-ood-interactive
+git clone https://github.com/SSHexa/nextpyp-interactive
 cd nextpyp-ood-interactive
 
 # Configure for your site

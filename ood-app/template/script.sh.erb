@@ -93,13 +93,21 @@ MEM_GB_PER_CPU=$(( MEM_MB / CPUS / 1024 ))
 [ "$MEM_GB_PER_CPU" -lt 1 ] && MEM_GB_PER_CPU=1
 echo "Slurm sizing: partition=${NEXTPYP_PARTITION} cpusPerTask=${CPUS} memPerCpuGB=${MEM_GB_PER_CPU}"
 
-# Keep shared Slurm template in sync with live partition size (best effort).
-TEMPLATE="${NEXTPYP_INSTALL}/templates/default.peb"
-if [ -w "$TEMPLATE" ]; then
-    sed -i "s|--mem-per-cpu=[0-9]*G|--mem-per-cpu=${MEM_GB_PER_CPU}G|" "$TEMPLATE"
-    echo "Patched $TEMPLATE with --mem-per-cpu=${MEM_GB_PER_CPU}G"
+# Stage our own SLURM template into the session and substitute the partition.
+# We do NOT modify Duke's install templates dir. Instead we ship a fixed
+# template alongside this launcher (nextpyp-default.peb, next to script.sh)
+# and tell nextPYP's config.toml to use it via templatesDir. Survives Duke
+# upstream updates cleanly.
+NEXTPYP_TEMPLATE_SRC="$(dirname "$0")/nextpyp-default.peb"
+SESSION_TEMPLATES="${SESSION_EXEC}/templates"
+if [ -f "$NEXTPYP_TEMPLATE_SRC" ]; then
+    mkdir -p "$SESSION_TEMPLATES"
+    cp "$NEXTPYP_TEMPLATE_SRC" "$SESSION_TEMPLATES/default.peb"
+    sed -i "s|__PARTITION__|${NEXTPYP_PARTITION}|g" "$SESSION_TEMPLATES/default.peb"
+    echo "Templates staged in ${SESSION_TEMPLATES} (partition=${NEXTPYP_PARTITION})"
 else
-    echo "Note: ${TEMPLATE} not writable; not patched. Set --mem-per-cpu manually if needed."
+    echo "WARNING: ${NEXTPYP_TEMPLATE_SRC} not found; falling back to ${NEXTPYP_INSTALL}/templates."
+    SESSION_TEMPLATES="${NEXTPYP_INSTALL}/templates"
 fi
 
 # ============================================
@@ -138,7 +146,7 @@ binds = ${CONFIG_BINDS_TOML}
 container = "${SESSION_EXEC}/containers/pyp.sif"
 
 [slurm]
-templatesDir = "${NEXTPYP_INSTALL}/templates"
+templatesDir = "${SESSION_TEMPLATES}"
 partition = "${NEXTPYP_PARTITION}"
 cpusPerTask = ${CPUS}
 memoryPerCpuGB = ${MEM_GB_PER_CPU}

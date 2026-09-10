@@ -1,0 +1,68 @@
+#---
+title = "Default"
+description = "Default SLURM template for nextPYP jobs (nextpyp-ood-interactive)"
+#---
+
+#!/bin/bash
+# nextpyp-ood-interactive default template.
+# Derived from Duke's upstream default.peb. Two changes from upstream:
+#   1. --partition is substituted with the site's ${NEXTPYP_PARTITION} at
+#      session start (see ood-app/template/script.sh.erb copy step).
+#   2. --mem line does NOT append `G` — upstream nextPYP already passes
+#      job.mem with its unit (e.g. "4G"), so appending G produced "4GG"
+#      and sbatch rejected it. We accept job.mem verbatim.
+
+#SBATCH --partition=__PARTITION__
+#SBATCH --job-name={{ job.name }}
+
+{% if job.dependency | exists %}
+#SBATCH --dependency={{ job.dependency }}
+{% endif %}
+
+{% if job.array | exists %}
+#SBATCH --array={{ job.array }}
+{% endif %}
+
+{% if job["cpus-per-task"] | exists %}
+#SBATCH --cpus-per-task={{ job["cpus-per-task"] }}
+{% endif %}
+
+{% if job.mem | exists %}
+#SBATCH --mem={{ job.mem }}
+{% endif %}
+
+{% if job.time | exists %}
+#SBATCH --time={{ job.time }}
+{% endif %}
+
+{% if job.type | exists %}
+{% if job.type == "launch" %}
+echo job.type = "launch"
+{% elseif job.type == "split" %}
+echo job.type = "split"
+{% elseif job.type == "merge" %}
+echo job.type = "merge"
+{% endif %}
+{% endif %}
+
+# Local RAM-backed scratch — avoids NFS semaphore failures with joblib/loky.
+mkdir -p /dev/shm/nextpyp_scratch
+chmod 777 /dev/shm/nextpyp_scratch
+
+# Inject env vars into apptainer container to fix joblib loky semaphore failure.
+export APPTAINERENV_JOBLIB_TEMP_FOLDER=/tmp
+export APPTAINERENV_LOKY_PICKLED_MAIN_PATH=/tmp
+export APPTAINERENV_TMPDIR=/tmp
+export APPTAINER_BINDPATH=/dev/shm
+
+# Auto-clean per-job scratch on exit (success, failure, or SIGKILL).
+# User+job scoped so concurrent array tasks on the same node are unaffected.
+_nextpyp_scratch_cleanup() {
+    local logf=/tmp/nextpyp_scratch_cleanup_${SLURM_JOB_ID:-noid}.log
+    { echo "--- pre-cleanup $(date) ---"; df -h /tmp/nextpyp_scratch 2>/dev/null; } >> "$logf" 2>&1 || true
+    rm -rf /tmp/nextpyp_scratch/${USER}/${SLURM_JOB_ID}* 2>/dev/null || true
+    { echo "--- post-cleanup $(date) ---"; df -h /tmp/nextpyp_scratch 2>/dev/null; } >> "$logf" 2>&1 || true
+}
+trap _nextpyp_scratch_cleanup EXIT
+
+{{ job.commands | raw }}

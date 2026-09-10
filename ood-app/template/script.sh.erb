@@ -33,9 +33,11 @@ if [ ! -f "${NEXTPYP_INSTALL}/nextPYP.sif" ]; then
 fi
 # pyp.sif can live in the Duke-standard install location OR at the persistent
 # per-user target (some sites move it out of the shared install to survive
-# reinstalls). Accept either — only fail if neither exists.
-if [ ! -f "${NEXTPYP_INSTALL}/sharedExec/containers/pyp.sif" ] \
-   && [ ! -f "${NEXTPYP_HOME:-$HOME/nextpyp}/exec/containers/pyp.sif" ]; then
+# reinstalls). It can also be a sandbox directory rather than a .sif file
+# (apptainer accepts both). Use -e to match any filesystem object at either
+# path; only fail if neither exists.
+if [ ! -e "${NEXTPYP_INSTALL}/sharedExec/containers/pyp.sif" ] \
+   && [ ! -e "${NEXTPYP_HOME:-$HOME/nextpyp}/exec/containers/pyp.sif" ]; then
     echo "FATAL: pyp.sif not found in either:"
     echo "  ${NEXTPYP_INSTALL}/sharedExec/containers/pyp.sif  (Duke default)"
     echo "  ${NEXTPYP_HOME:-$HOME/nextpyp}/exec/containers/pyp.sif  (persistent per-user)"
